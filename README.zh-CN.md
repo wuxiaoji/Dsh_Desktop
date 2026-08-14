@@ -15,7 +15,7 @@
   <a href="./README.md">English</a> · <strong>简体中文</strong>
 </p>
 
-基于 [Tauri 2](https://tauri.app) 的轻量 Windows 桌面主机，用于启动本机安装的
+基于 [Tauri 2](https://tauri.app) 的轻量 Windows 桌面版，用于启动本机安装的
 [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) 并展示其原始 Web 界面。
 本项目不修改、不复制、不重新构建 DSH。
 
