@@ -1,6 +1,6 @@
 {
   "name": "dsh-desktop-host",
-  "version": "0.1.5",
+  "version": "0.1.8",
   "private": true,
   "description": "A lightweight Windows desktop host for DeepSeek Harness.",
   "type": "module",

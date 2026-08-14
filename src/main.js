@@ -21,17 +21,9 @@ const rows = {
   server: document.querySelector("#check-server"),
 };
 
-const SKIP_KEY = "dsh.skipUpdateVersion";
 let navigating = false;
 let pollTimer;
 const stageProgress = { idle: 4, checking_webview: 14, checking_node: 30, checking_dsh: 52, installing_dsh: 60, updating_dsh: 64, starting_server: 72, waiting_for_server: 88, ready: 100, failed: 100, stopping: 100 };
-
-function skippedVersion() {
-  try { return localStorage.getItem(SKIP_KEY) || ""; } catch { return ""; }
-}
-function setSkippedVersion(version) {
-  try { localStorage.setItem(SKIP_KEY, version || ""); } catch { /* ignore */ }
-}
 
 function setRow(row, state, value) {
   row.dataset.state = state;
@@ -54,11 +46,11 @@ function render(snapshot) {
 
   const updating = snapshot.status === "updating";
   const latest = snapshot.dsh_latest || "";
-  const skipped = latest && latest === skippedVersion();
-  updateBar.hidden = !(snapshot.dsh_update_available || updating) || snapshot.status === "ready" || skipped;
+  updateBar.hidden = !(snapshot.dsh_update_available || updating) || snapshot.status === "ready";
   updateButton.disabled = updating;
   updateButton.textContent = updating ? "更新中…" : "立即更新";
   skipButton.hidden = updating;
+  skipButton.disabled = updating;
   updateMeta.dataset.latest = latest;
   updateMeta.dataset.current = snapshot.dsh_version || "未知";
   updateMeta.textContent = updating ? "正在升级到最新版本…" : latest ? `当前 ${snapshot.dsh_version ?? "未知"} → 最新 ${latest}` : "";
@@ -128,9 +120,16 @@ async function confirmUpdate() {
 retryButton.addEventListener("click", launch);
 updateButton.addEventListener("click", openConfirm);
 skipButton.addEventListener("click", () => {
-  const latest = updateMeta.dataset.latest;
-  if (latest) setSkippedVersion(latest);
-  updateBar.hidden = true;
+  updateButton.disabled = true;
+  skipButton.disabled = true;
+  invoke("continue_without_update")
+    .then(render)
+    .catch((error) => {
+      statusTitle.textContent = "无法继续启动";
+      statusDetail.textContent = String(error);
+      updateButton.disabled = false;
+      skipButton.disabled = false;
+    });
 });
 confirmCancel.addEventListener("click", closeConfirm);
 confirmOk.addEventListener("click", confirmUpdate);

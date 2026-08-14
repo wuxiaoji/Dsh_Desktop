@@ -1,3 +1,4 @@
+use semver::Version;
 use serde::Serialize;
 use std::{
     cmp::Ordering,
@@ -107,8 +108,14 @@ fn launcher_status(state: State<'_, LauncherState>) -> LauncherSnapshot {
 #[tauri::command]
 fn launch_dsh(state: State<'_, LauncherState>) -> LauncherSnapshot {
     let (generation, snapshot) = {
-        let mut inner = state.inner.lock().unwrap_or_else(|error| error.into_inner());
-        if matches!(inner.snapshot.status.as_str(), "starting" | "ready") {
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(
+            inner.snapshot.status.as_str(),
+            "starting" | "awaiting_update" | "updating" | "ready"
+        ) {
             return inner.snapshot.clone();
         }
         inner.generation += 1;
@@ -133,11 +140,18 @@ fn launch_dsh(state: State<'_, LauncherState>) -> LauncherSnapshot {
 #[tauri::command]
 fn update_dsh(state: State<'_, LauncherState>) -> LauncherSnapshot {
     let (generation, old_pid, snapshot) = {
-        let mut inner = state.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         if inner.snapshot.status == "updating" {
             return inner.snapshot.clone();
         }
+        if inner.snapshot.status != "awaiting_update" {
+            return inner.snapshot.clone();
+        }
         let old_pid = inner.child_pid.take();
+        let latest = inner.snapshot.dsh_latest.clone();
         inner.generation += 1;
         inner.snapshot = LauncherSnapshot {
             status: "updating".into(),
@@ -148,6 +162,7 @@ fn update_dsh(state: State<'_, LauncherState>) -> LauncherSnapshot {
             webview2_available: true,
             node_version: inner.snapshot.node_version.clone(),
             dsh_version: inner.snapshot.dsh_version.clone(),
+            dsh_latest: latest,
             ..LauncherSnapshot::default()
         };
         (inner.generation, old_pid, inner.snapshot.clone())
@@ -159,6 +174,34 @@ fn update_dsh(state: State<'_, LauncherState>) -> LauncherSnapshot {
 
     let shared = Arc::clone(&state.inner);
     thread::spawn(move || update_worker(shared, generation));
+    snapshot
+}
+
+#[tauri::command]
+fn continue_without_update(state: State<'_, LauncherState>) -> LauncherSnapshot {
+    let (generation, snapshot) = {
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if inner.snapshot.status != "awaiting_update" {
+            return inner.snapshot.clone();
+        }
+        inner.snapshot.status = "starting".into();
+        inner.snapshot.dsh_update_available = false;
+        inner.snapshot.title = "已选择暂不更新".into();
+        inner.snapshot.detail = "正在继续启动本地服务。".into();
+        (inner.generation, inner.snapshot.clone())
+    };
+
+    let shared = Arc::clone(&state.inner);
+    thread::spawn(move || {
+        if let Err(error) = start_dsh_server(&shared, generation) {
+            if current_status(&shared, generation) != "stopping" {
+                fail(&shared, generation, "DSH 启动失败", error);
+            }
+        }
+    });
     snapshot
 }
 
@@ -182,7 +225,9 @@ fn launch_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
             return;
         }
     };
-    update(&shared, generation, |snapshot| snapshot.node_version = Some(node_version));
+    update(&shared, generation, |snapshot| {
+        snapshot.node_version = Some(node_version)
+    });
 
     update(&shared, generation, |snapshot| {
         snapshot.step = "checking_dsh".into();
@@ -208,8 +253,19 @@ fn launch_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
             }
         },
     };
-    update(&shared, generation, |snapshot| snapshot.dsh_version = Some(dsh_version.clone()));
-    check_dsh_update(&shared, generation, &dsh_version);
+    update(&shared, generation, |snapshot| {
+        snapshot.dsh_version = Some(dsh_version.clone());
+        snapshot.title = "正在校验 DeepSeek Harness 版本".into();
+        snapshot.detail = format!("正在通过阿里云 npm 镜像查询最新版本（{NPM_REGISTRY}）。");
+    });
+    match check_dsh_update(&shared, generation, &dsh_version) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            fail(&shared, generation, "无法校验 DSH 最新版本", error);
+            return;
+        }
+    }
 
     if let Err(error) = start_dsh_server(&shared, generation) {
         if current_status(&shared, generation) != "stopping" {
@@ -219,6 +275,10 @@ fn launch_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
 }
 
 fn update_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
+    let expected_version = {
+        let inner = shared.lock().unwrap_or_else(|error| error.into_inner());
+        inner.snapshot.dsh_latest.clone()
+    };
     if let Err(error) = run_version("npm --version") {
         if current_status(&shared, generation) != "stopping" {
             fail(
@@ -231,7 +291,8 @@ fn update_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
         return;
     }
 
-    let install_command = format!("npm install --global @deepseek-ai/dsh@latest --registry={NPM_REGISTRY}");
+    let install_command =
+        format!("npm install --global @deepseek-ai/dsh@latest --registry={NPM_REGISTRY}");
     if let Err(error) = run_npm_command(&shared, generation, &install_command) {
         if current_status(&shared, generation) != "stopping" {
             fail(&shared, generation, "DSH 更新失败", error);
@@ -254,6 +315,31 @@ fn update_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
             return;
         }
     };
+    if let Some(expected) = expected_version {
+        let installed = match normalize_version(&dsh_version) {
+            Ok(version) => version,
+            Err(error) => {
+                fail(&shared, generation, "无法验证更新结果", error);
+                return;
+            }
+        };
+        match compare_semver(&installed, &expected) {
+            Ok(Ordering::Less) => {
+                fail(
+                    &shared,
+                    generation,
+                    "DSH 更新未完成",
+                    format!("更新后检测到版本 {installed}，仍低于目标版本 {expected}。"),
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                fail(&shared, generation, "无法验证更新结果", error);
+                return;
+            }
+        }
+    }
     update(&shared, generation, |snapshot| {
         snapshot.dsh_version = Some(dsh_version);
         snapshot.dsh_latest = None;
@@ -269,7 +355,10 @@ fn update_worker(shared: Arc<Mutex<LauncherInner>>, generation: u64) {
 
 fn spawn_dsh() -> Result<Child, String> {
     let mut command = shell_command("dsh web --host 127.0.0.1 --port 0");
-    command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
     if let Some(home) = std::env::var_os("USERPROFILE") {
         command.current_dir(home);
     }
@@ -303,7 +392,12 @@ fn monitor_dsh(shared: &Arc<Mutex<LauncherInner>>, generation: u64, child: &mut 
 
     loop {
         if let Ok((is_stdout, line)) = receiver.recv_timeout(Duration::from_millis(200)) {
-            push_log(shared, generation, if is_stdout { "OUT" } else { "ERR" }, &line);
+            push_log(
+                shared,
+                generation,
+                if is_stdout { "OUT" } else { "ERR" },
+                &line,
+            );
             if !ready {
                 if let Some(url) = extract_local_url(&line) {
                     update(shared, generation, |snapshot| {
@@ -396,14 +490,17 @@ fn install_dsh(shared: &Arc<Mutex<LauncherInner>>, generation: u64) -> Result<St
     });
 
     if let Err(error) = run_version("npm --version") {
-        return Err(format!("未找到 npm：{error} 请安装 Node.js（自带 npm）后重试。"));
+        return Err(format!(
+            "未找到 npm：{error} 请安装 Node.js（自带 npm）后重试。"
+        ));
     }
 
     update(shared, generation, |snapshot| {
         snapshot.detail = "npm 正在下载并安装 @deepseek-ai/dsh，可能需要几分钟，请稍候。".into();
     });
 
-    let install_command = format!("npm install --global @deepseek-ai/dsh --registry={NPM_REGISTRY}");
+    let install_command =
+        format!("npm install --global @deepseek-ai/dsh --registry={NPM_REGISTRY}");
     run_npm_command(shared, generation, &install_command)?;
 
     // 记录“由本应用安装”标记：卸载器据此决定是否清理全局 dsh，避免误删用户独立安装的 dsh
@@ -415,9 +512,16 @@ fn install_dsh(shared: &Arc<Mutex<LauncherInner>>, generation: u64) -> Result<St
     }
 }
 
-fn run_npm_command(shared: &Arc<Mutex<LauncherInner>>, generation: u64, command_line: &str) -> Result<(), String> {
+fn run_npm_command(
+    shared: &Arc<Mutex<LauncherInner>>,
+    generation: u64,
+    command_line: &str,
+) -> Result<(), String> {
     let mut command = shell_command(command_line);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
     if let Some(home) = std::env::var_os("USERPROFILE") {
         command.current_dir(home);
     }
@@ -512,64 +616,54 @@ fn start_dsh_server(shared: &Arc<Mutex<LauncherInner>>, generation: u64) -> Resu
     Ok(())
 }
 
-fn check_dsh_update(shared: &Arc<Mutex<LauncherInner>>, generation: u64, current: &str) {
-    let current = normalize_version(current);
-    let shared = Arc::clone(shared);
-    thread::spawn(move || {
-        let latest = match run_version(&format!(
-            "npm view @deepseek-ai/dsh version --registry={NPM_REGISTRY}"
-        )) {
-            Ok(version) => normalize_version(&version),
-            Err(_) => return, // 查询失败（如离线）则静默跳过，不阻塞启动
-        };
-        // 仅当远端版本确实高于当前版本时才提示更新，避免每次启动都误报“有新版本”
-        if is_newer_version(&latest, &current) {
-            update(&shared, generation, |snapshot| {
-                snapshot.dsh_latest = Some(latest);
-                snapshot.dsh_update_available = true;
-            });
+fn check_dsh_update(
+    shared: &Arc<Mutex<LauncherInner>>,
+    generation: u64,
+    current: &str,
+) -> Result<bool, String> {
+    let latest = run_version(&format!(
+        "npm view @deepseek-ai/dsh version --registry={NPM_REGISTRY}"
+    ))
+    .map_err(|error| format!("查询 npm 最新版本失败：{error} 请检查网络后重试。"))?;
+    let current = normalize_version(current)?;
+    let latest = normalize_version(&latest)?;
+    let update_available = compare_semver(&latest, &current)? == Ordering::Greater;
+
+    update(shared, generation, |snapshot| {
+        snapshot.dsh_latest = Some(latest.clone());
+        snapshot.dsh_update_available = update_available;
+        if update_available {
+            snapshot.status = "awaiting_update".into();
+            snapshot.phase_label = "UPDATE REQUIRED".into();
+            snapshot.title = "发现 DeepSeek Harness 新版本".into();
+            snapshot.detail = "请选择立即更新或暂不更新；作出选择前不会启动本地服务。".into();
         }
     });
+    Ok(update_available)
 }
 
-// 判断 latest 是否严格高于 current（语义化版本比较）
-fn is_newer_version(latest: &str, current: &str) -> bool {
-    compare_semver(latest, current) == Ordering::Greater
+fn compare_semver(left: &str, right: &str) -> Result<Ordering, String> {
+    Ok(parse_semver(left)?.cmp(&parse_semver(right)?))
 }
 
-// 将 "0.1.3"、"v1.2.3"、"dsh 1.2.3" 等版本号解析为数字段后逐段比较
-fn compare_semver(left: &str, right: &str) -> Ordering {
-    fn parse(value: &str) -> Vec<u64> {
-        value
-            .split(|character: char| !character.is_ascii_digit())
-            .filter(|part| !part.is_empty())
-            .filter_map(|part| part.parse::<u64>().ok())
-            .collect()
-    }
-
-    let left = parse(left);
-    let right = parse(right);
-    let length = left.len().max(right.len());
-    for index in 0..length {
-        let left_part = left.get(index).copied().unwrap_or(0);
-        let right_part = right.get(index).copied().unwrap_or(0);
-        match left_part.cmp(&right_part) {
-            Ordering::Equal => continue,
-            ordering => return ordering,
-        }
-    }
-    Ordering::Equal
-}
-
-fn normalize_version(value: &str) -> String {
-    value
+fn normalize_version(value: &str) -> Result<String, String> {
+    let version = value
         .trim()
         .split_whitespace()
-        .find(|part| part.chars().next().map_or(false, |c| c.is_ascii_digit()) || part.starts_with('v'))
+        .find(|part| {
+            part.chars().next().is_some_and(|c| c.is_ascii_digit()) || part.starts_with(['v', 'V'])
+        })
         .unwrap_or(value.trim())
         .trim_start_matches(['v', 'V'])
-        .trim_end_matches(['.', '-'])
-        .to_string()
+        .trim_end_matches(['.', ','])
+        .to_string();
+    parse_semver(&version)?;
+    Ok(version)
+}
+
+fn parse_semver(value: &str) -> Result<Version, String> {
+    Version::parse(value)
+        .map_err(|_| format!("无法识别版本号“{value}”，预期为有效的语义化版本号。"))
 }
 
 fn shell_command(command_line: &str) -> Command {
@@ -590,7 +684,10 @@ fn shell_command(command_line: &str) -> Command {
 
 fn extract_local_url(line: &str) -> Option<String> {
     let start = line.find("dsh web: http://127.0.0.1:")? + "dsh web: ".len();
-    let candidate = line[start..].split_whitespace().next()?.trim_end_matches('/');
+    let candidate = line[start..]
+        .split_whitespace()
+        .next()?
+        .trim_end_matches('/');
     let port = candidate.rsplit(':').next()?;
     if port.parse::<u16>().is_ok() {
         Some(candidate.to_string())
@@ -678,19 +775,62 @@ fn kill_process_tree(pid: u32) {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_semver, normalize_version};
+    use std::cmp::Ordering;
+
+    #[test]
+    fn compares_only_strictly_newer_versions_as_greater() {
+        assert_eq!(compare_semver("1.2.4", "1.2.3").unwrap(), Ordering::Greater);
+        assert_eq!(compare_semver("1.2.3", "1.2.3").unwrap(), Ordering::Equal);
+        assert_eq!(compare_semver("1.2.2", "1.2.3").unwrap(), Ordering::Less);
+        assert_eq!(
+            compare_semver("0.1.0-rc.6", "0.1.0-rc.6").unwrap(),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_semver("0.1.0-rc.6", "0.1.0-rc.5").unwrap(),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn normalizes_dsh_version_output() {
+        assert_eq!(normalize_version("dsh 1.2.3").unwrap(), "1.2.3");
+        assert_eq!(normalize_version("v2.0.1").unwrap(), "2.0.1");
+    }
+
+    #[test]
+    fn rejects_unverifiable_versions() {
+        assert!(normalize_version("unknown").is_err());
+        assert!(compare_semver("1.2", "1.2.0").is_err());
     }
 }
 
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(LauncherState::new())
-        .invoke_handler(tauri::generate_handler![launch_dsh, launcher_status, update_dsh])
+        .invoke_handler(tauri::generate_handler![
+            launch_dsh,
+            launcher_status,
+            update_dsh,
+            continue_without_update
+        ])
         .build(tauri::generate_context!())
         .expect("failed to build the DSH desktop host");
 
     app.run(|app_handle, event| {
-        if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
             app_handle.state::<LauncherState>().stop();
         }
     });

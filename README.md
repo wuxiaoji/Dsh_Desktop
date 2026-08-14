@@ -18,6 +18,19 @@ A lightweight Windows desktop built with [Tauri 2](https://tauri.app) that launc
 locally installed [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) and shows
 its original web UI. It does not patch, copy, or rebuild DSH.
 
+## Project Motivation
+
+This project is intended for people who are not familiar with command-line tools, Node.js, or
+local web-service setup. It provides a ready-to-use Windows desktop entry point that lowers the
+barrier to installing and using DeepSeek Harness.
+
+This project is a non-invasive desktop host, not a modified distribution of DSH. It does not alter
+DSH source code, installed files, or runtime code; inject patches; copy DSH; or repackage it. The app
+only uses the public `dsh` and `npm` commands to check the environment, install or update the official
+package, verify versions, start the local service, and manage the DSH child process it started. On
+uninstall, the global npm package is removed only when the app can confirm that it originally
+installed DSH automatically; independently installed copies are left untouched.
+
 ## Features
 
 - Checks the runtime environment (WebView2, Node.js, `dsh`) before starting
