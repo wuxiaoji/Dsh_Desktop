@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/logo-transparent.png" alt="DeepSeek Harness Desktop" width="140">
+  <img src="public/logo.png" alt="DeepSeek Harness Desktop" width="140">
 </p>
 
 <h1 align="center">DeepSeek Harness Desktop</h1>

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="public/logo-transparent.png" alt="DeepSeek Harness Desktop" width="140">
+  <img src="public/logo.png" alt="DeepSeek Harness Desktop" width="140">
 </p>
 
 <h1 align="center">DeepSeek Harness Desktop</h1>
@@ -14,8 +14,7 @@
 <p align="center">
   <strong>English</strong> · <a href="./README.zh-CN.md">简体中文</a>
 </p>
-
-A lightweight Windows desktop host built with [Tauri 2](https://tauri.app) that launches the
+A lightweight Windows desktop built with [Tauri 2](https://tauri.app) that launches the
 locally installed [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) and shows
 its original web UI. It does not patch, copy, or rebuild DSH.
 

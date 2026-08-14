@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::{
+    cmp::Ordering,
     collections::VecDeque,
     io::{BufRead, BufReader},
     net::{SocketAddr, TcpStream},
@@ -521,13 +522,43 @@ fn check_dsh_update(shared: &Arc<Mutex<LauncherInner>>, generation: u64, current
             Ok(version) => normalize_version(&version),
             Err(_) => return, // 查询失败（如离线）则静默跳过，不阻塞启动
         };
-        if !latest.is_empty() && latest != current {
+        // 仅当远端版本确实高于当前版本时才提示更新，避免每次启动都误报“有新版本”
+        if is_newer_version(&latest, &current) {
             update(&shared, generation, |snapshot| {
                 snapshot.dsh_latest = Some(latest);
                 snapshot.dsh_update_available = true;
             });
         }
     });
+}
+
+// 判断 latest 是否严格高于 current（语义化版本比较）
+fn is_newer_version(latest: &str, current: &str) -> bool {
+    compare_semver(latest, current) == Ordering::Greater
+}
+
+// 将 "0.1.3"、"v1.2.3"、"dsh 1.2.3" 等版本号解析为数字段后逐段比较
+fn compare_semver(left: &str, right: &str) -> Ordering {
+    fn parse(value: &str) -> Vec<u64> {
+        value
+            .split(|character: char| !character.is_ascii_digit())
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<u64>().ok())
+            .collect()
+    }
+
+    let left = parse(left);
+    let right = parse(right);
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        let left_part = left.get(index).copied().unwrap_or(0);
+        let right_part = right.get(index).copied().unwrap_or(0);
+        match left_part.cmp(&right_part) {
+            Ordering::Equal => continue,
+            ordering => return ordering,
+        }
+    }
+    Ordering::Equal
 }
 
 fn normalize_version(value: &str) -> String {
